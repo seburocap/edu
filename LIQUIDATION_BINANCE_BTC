@@ -1,0 +1,385 @@
+import websocket
+import json
+import datetime
+import pandas as pd
+from threading import Thread
+import time
+import requests
+
+class BinanceLiquidationTrackerTelegram:
+    def __init__(self, symbol='BTCUSDT', telegram_bot_token=None, telegram_chat_id=None):
+        self.symbol = symbol
+        self.liquidations = []
+        self.websocket_url = f"wss://fstream.binance.com/ws/!forceOrder@arr"
+        self.is_running = True
+        
+        # Telegram настройки
+        self.telegram_bot_token = telegram_bot_token
+        self.telegram_chat_id = telegram_chat_id
+        
+        # Для 5-минутной статистики
+        self.five_min_data = []
+        self.last_aggregate_time = datetime.datetime.now()
+        
+    def send_telegram_message(self, message, parse_mode='Markdown'):
+        """Отправляет сообщение в Telegram канал"""
+        if not self.telegram_bot_token or not self.telegram_chat_id:
+            return False
+        
+        url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+        data = {
+            "chat_id": self.telegram_chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True
+        }
+        
+        try:
+            response = requests.post(url, data=data)
+            if response.status_code == 200:
+                return True
+            else:
+                print(f"Ошибка отправки в Telegram: {response.text}")
+                return False
+        except Exception as e:
+            print(f"Ошибка при отправке в Telegram: {e}")
+            return False
+    
+    def format_liquidation_message(self, liquidation):
+        """Форматирует сообщение о ликвидации для Telegram"""
+        total_value = liquidation['quantity'] * liquidation['price']
+        
+        # Выбираем эмодзи в зависимости от стороны ликвидации
+        emoji = "🔴" if liquidation['side'] == "SELL" else "🟢"
+        
+        message = f"""
+{emoji} *Ликвидация {liquidation['side'].upper()}*
+⚡️ *{liquidation['symbol']}*
+
+📅 Время: `{liquidation['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}`
+💰 Цена: `${liquidation['price']:,.2f}`
+📊 Объем: `{liquidation['quantity']:.6f} BTC`
+💵 Стоимость: `${total_value:,.2f}`
+"""
+        return message
+    
+    def format_five_min_stats_message(self, df):
+        """Форматирует 5-минутный отчет для Telegram"""
+        side_stats = df.groupby('side').agg({
+            'quantity': ['count', 'sum'],
+            'price': 'mean'
+        })
+        
+        message = f"""
+📊 *5-минутный отчет*
+🕒 Время: `{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+
+📈 *Ликвидации по сторонам:*
+"""
+        
+        for side in side_stats.index:
+            count = side_stats.loc[side, ('quantity', 'count')]
+            total_quantity = side_stats.loc[side, ('quantity', 'sum')]
+            avg_price = side_stats.loc[side, ('price', 'mean')]
+            total_value = total_quantity * avg_price
+            
+            side_emoji = "🔴" if side == "SELL" else "🟢"
+            message += f"""
+{side_emoji} *{side} ликвидации:*
+   • Количество: `{count}`
+   • Объем: `{total_quantity:.6f} BTC`
+   • Средняя цена: `${avg_price:,.2f}`
+   • Стоимость: `${total_value:,.2f}`
+"""
+        
+        # Общая статистика
+        total_liquidations = len(df)
+        total_volume = df['quantity'].sum()
+        avg_price = df['price'].mean()
+        total_value = (df['quantity'] * df['price']).sum()
+        
+        message += f"""
+🌍 *Общая статистика:*
+   • Всего ликвидаций: `{total_liquidations}`
+   • Общий объем: `{total_volume:.6f} BTC`
+   • Средняя цена: `${avg_price:,.2f}`
+   • Общая стоимость: `${total_value:,.2f}`
+"""
+        return message
+    
+    def on_message(self, ws, message):
+        """Обработчик сообщений от WebSocket"""
+        try:
+            data = json.loads(message)
+            
+            # Фильтруем только позиции BTCUSDT
+            if self.symbol in data['o']['s']:
+                liquidation_data = {
+                    'timestamp': datetime.datetime.fromtimestamp(data['E'] / 1000),
+                    'symbol': data['o']['s'],
+                    'side': data['o']['S'],  # BUY/SELL
+                    'order_type': data['o']['o'],
+                    'time_in_force': data['o']['f'],
+                    'quantity': float(data['o']['q']),
+                    'price': float(data['o']['p']),
+                    'average_price': float(data['o']['ap']),
+                    'order_status': data['o']['X'],
+                    'last_filled_qty': float(data['o']['l']),
+                    'cumulative_filled_qty': float(data['o']['z']),
+                    'trade_time': datetime.datetime.fromtimestamp(data['o']['T'] / 1000)
+                }
+                
+                self.liquidations.append(liquidation_data)
+                self.five_min_data.append(liquidation_data)
+                self.print_liquidation(liquidation_data)
+                
+                # Отправляем уведомление в Telegram
+                telegram_message = self.format_liquidation_message(liquidation_data)
+                self.send_telegram_message(telegram_message)
+                
+                # Проверяем, прошло ли 5 минут
+                self.check_and_display_five_min_stats()
+                
+        except Exception as e:
+            print(f"Ошибка при обработке сообщения: {e}")
+    
+    def on_error(self, ws, error):
+        """Обработчик ошибок"""
+        print(f"Ошибка: {error}")
+    
+    def on_close(self, ws, close_status_code, close_msg):
+        """Обработчик закрытия соединения"""
+        print("Соединение закрыто")
+    
+    def on_open(self, ws):
+        """Обработчик открытия соединения"""
+        print(f"Подключение установлено. Отслеживаем ликвидации {self.symbol}...")
+        
+        # Отправляем уведомление о запуске
+        start_message = f"""
+🚀 *Запущен трекер ликвидаций*
+📍 Символ: `{self.symbol}`
+🕒 Время: `{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+"""
+        self.send_telegram_message(start_message)
+    
+    def print_liquidation(self, liquidation):
+        """Печать информации о ликвидации"""
+        print("="*50)
+        print(f"🔥 ЛИКВИДАЦИЯ - {liquidation['side'].upper()}")
+        print(f"Время: {liquidation['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Символ: {liquidation['symbol']}")
+        print(f"Цена: ${liquidation['price']:,.2f}")
+        print(f"Объем: {liquidation['quantity']:.6f}")
+        print(f"Стоимость: ${liquidation['quantity'] * liquidation['price']:,.2f}")
+        print(f"Статус: {liquidation['order_status']}")
+        print("="*50)
+    
+    def check_and_display_five_min_stats(self):
+        """Проверяет, прошло ли 5 минут, и выводит агрегированную статистику"""
+        current_time = datetime.datetime.now()
+        time_diff = current_time - self.last_aggregate_time
+        
+        if time_diff.total_seconds() >= 300:  # 5 минут
+            self.display_five_min_stats()
+            self.last_aggregate_time = current_time
+            self.five_min_data = []  # Сбрасываем данные за 5 минут
+    
+    def display_five_min_stats(self):
+        """Отображает агрегированную статистику за последние 5 минут"""
+        if not self.five_min_data:
+            print("\n📊 5-минутный отчет: За последние 5 минут не было ликвидаций")
+            return
+        
+        df = pd.DataFrame(self.five_min_data)
+        
+        print("\n" + "="*70)
+        print(f"📊 5-МИНУТНЫЙ ОТЧЕТ (Время: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
+        print("="*70)
+        
+        # Отправляем отчет в Telegram
+        telegram_message = self.format_five_min_stats_message(df)
+        self.send_telegram_message(telegram_message)
+        
+        # Обычный вывод в консоль
+        # Статистика по сторонам
+        print("\n📈 ЛИКВИДАЦИИ ПО СТОРОНАМ:")
+        side_stats = df.groupby('side').agg({
+            'quantity': ['count', 'sum'],
+            'price': 'mean'
+        })
+        
+        for side in side_stats.index:
+            count = side_stats.loc[side, ('quantity', 'count')]
+            total_quantity = side_stats.loc[side, ('quantity', 'sum')]
+            avg_price = side_stats.loc[side, ('price', 'mean')]
+            total_value = total_quantity * avg_price
+            
+            print(f"\n{side} ликвидации:")
+            print(f"  - Количество: {count}")
+            print(f"  - Общий объем: {total_quantity:.6f} BTC")
+            print(f"  - Средняя цена: ${avg_price:,.2f}")
+            print(f"  - Общая стоимость: ${total_value:,.2f}")
+        
+        # Общая статистика
+        print("\n🌍 ОБЩАЯ СТАТИСТИКА:")
+        print(f"  - Всего ликвидаций: {len(df)}")
+        print(f"  - Общий объем: {df['quantity'].sum():.6f} BTC")
+        print(f"  - Средняя цена: ${df['price'].mean():,.2f}")
+        print(f"  - Общая стоимость: ${(df['quantity'] * df['price']).sum():,.2f}")
+        print(f"  - Крупнейшая ликвидация: {df['quantity'].max():.6f} BTC")
+        print(f"  - Мелкая ликвидация: {df['quantity'].min():.6f} BTC")
+        
+        print("="*70)
+        
+    def check_five_min_periodically(self):
+        """Периодически проверяет, нужно ли вывести 5-минутную статистику"""
+        while self.is_running:
+            self.check_and_display_five_min_stats()
+            time.sleep(60)  # Проверяем каждую минуту
+    
+    def save_to_csv(self, filename=None):
+        """Сохранение всех ликвидаций в CSV файл"""
+        if not self.liquidations:
+            print("Нет данных для сохранения")
+            return
+        
+        if filename is None:
+            filename = f"binance_liquidations_{self.symbol}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        df = pd.DataFrame(self.liquidations)
+        df.to_csv(filename, index=False)
+        print(f"Данные сохранены в файл: {filename}")
+    
+    def get_statistics(self):
+        """Получение статистики по ликвидациям"""
+        if not self.liquidations:
+            print("Нет данных для анализа")
+            return
+        
+        df = pd.DataFrame(self.liquidations)
+        
+        print("\n📊 СТАТИСТИКА ЛИКВИДАЦИЙ:")
+        print(f"Всего ликвидаций: {len(self.liquidations)}")
+        print(f"Период: {df['timestamp'].min()} - {df['timestamp'].max()}")
+        
+        print("\nПо типу позиций:")
+        print(df['side'].value_counts())
+        
+        print("\nОбщие объемы:")
+        print(f"Общий объем BTC: {df['quantity'].sum():.4f}")
+        print(f"Общая стоимость в USD: ${(df['quantity'] * df['price']).sum():,.2f}")
+        
+        print("\nСредние значения:")
+        print(f"Средний объем ликвидации: {df['quantity'].mean():.6f} BTC")
+        print(f"Средняя цена: ${df['price'].mean():,.2f}")
+        
+        return df
+    
+    def start(self):
+        """Запуск WebSocket соединения"""
+        self.ws = websocket.WebSocketApp(
+            self.websocket_url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open
+        )
+        
+        # Запускаем WebSocket в отдельном потоке
+        self.ws_thread = Thread(target=self.ws.run_forever)
+        self.ws_thread.daemon = True
+        self.ws_thread.start()
+        
+        # Запускаем поток для периодической проверки 5-минутной статистики
+        self.check_thread = Thread(target=self.check_five_min_periodically)
+        self.check_thread.daemon = True
+        self.check_thread.start()
+    
+    def stop(self):
+        """Остановка трекера"""
+        self.is_running = False
+        self.ws.close()
+        self.ws_thread.join(timeout=1)
+        self.check_thread.join(timeout=1)
+        print("Трекер остановлен")
+        
+        # Отправляем уведомление об остановке
+        stop_message = f"""
+🛑 *Трекер остановлен*
+🕒 Время: `{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`
+"""
+        self.send_telegram_message(stop_message)
+
+# Класс с алертами по крупным ликвидациям
+class AlertLiquidationTrackerTelegram(BinanceLiquidationTrackerTelegram):
+    def __init__(self, symbol='BTCUSDT', telegram_bot_token=None, telegram_chat_id=None, min_alert_value=1000):
+        super().__init__(symbol, telegram_bot_token, telegram_chat_id)
+        self.min_alert_value = min_alert_value  # минимальная стоимость для алерта
+    
+    def print_liquidation(self, liquidation):
+        """Переопределяем метод для добавления алертов"""
+        total_value = liquidation['quantity'] * liquidation['price']
+        
+        if total_value >= self.min_alert_value:
+            print("\n🚨 КРУПНАЯ ЛИКВИДАЦИЯ! 🚨")
+            super().print_liquidation(liquidation)
+            
+            # Отправляем специальный алерт для крупных ликвидаций
+            alert_message = f"""
+🚨 *КРУПНАЯ ЛИКВИДАЦИЯ!!!*
+{self.format_liquidation_message(liquidation)}
+⚠️ Стоимость превышает: `${self.min_alert_value:,.2f}`
+"""
+            self.send_telegram_message(alert_message)
+        else:
+            # Печатаем только время и основную инфо для мелких ликвидаций
+            print(f"[{liquidation['timestamp'].strftime('%H:%M:%S')}] {liquidation['side']} ${total_value:,.2f}")
+            
+            # Для мелких ликвидаций отправляем компактный формат
+            compact_message = f"""
+{liquidation['timestamp'].strftime('%H:%M:%S')} | {liquidation['side']} | ${total_value:,.2f}
+"""
+            self.send_telegram_message(compact_message)
+
+# Пример использования
+if __name__ == "__main__":
+    # Замените эти значения на ваши данные
+    TELEGRAM_BOT_TOKEN = "СЮДА_ТОКЕН_БОТА"
+    TELEGRAM_CHAT_ID = "СЮДА_ID_ЧАТА"  # Для канала начинается с -100
+    
+    # Создаем трекер с поддержкой Telegram
+    tracker = BinanceLiquidationTrackerTelegram(
+        symbol='BTCUSDT',
+        telegram_bot_token=TELEGRAM_BOT_TOKEN,
+        telegram_chat_id=TELEGRAM_CHAT_ID
+    )
+    
+    print("📡 Запуск трекера ликвидаций Binance с поддержкой Telegram...")
+    print("Нажмите Ctrl+C для остановки")
+    
+    try:
+        # Запускаем трекер
+        tracker.start()
+        
+        # Поддерживаем работу программы
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n⏹️ Остановка трекера...")
+        tracker.stop()
+        
+        # Сохраняем данные и выводим статистику
+        tracker.save_to_csv()
+        tracker.get_statistics()
+        
+        print("\n✅ Программа завершена")
+
+# Пример с алертами по крупным ликвидациям
+# tracker = AlertLiquidationTrackerTelegram(
+#     symbol='BTCUSDT',
+#     telegram_bot_token=TELEGRAM_BOT_TOKEN,
+#     telegram_chat_id=TELEGRAM_CHAT_ID,
+#     min_alert_value=5000
+# )
