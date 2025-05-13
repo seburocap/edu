@@ -1,0 +1,224 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+import requests
+from binance.client import Client
+import warnings
+warnings.filterwarnings('ignore')
+
+# Настройка клиента Binance (без API ключей для общедоступного API)
+client = Client("", "")
+
+# Функция для получения данных
+def get_historical_klines(symbol, interval, start_date, end_date):
+    klines = client.get_historical_klines(
+        symbol=symbol,
+        interval=interval,
+        start_str=start_date,
+        end_str=end_date
+    )
+    
+    data = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+    ])
+    
+    # Преобразование типов данных
+    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+    data['open'] = data['open'].astype(float)
+    data['high'] = data['high'].astype(float)
+    data['low'] = data['low'].astype(float)
+    data['close'] = data['close'].astype(float)
+    data['volume'] = data['volume'].astype(float)
+    
+    return data.set_index('timestamp')
+
+# Получение данных
+start_date = "2022-01-01"
+end_date = "2025-05-01"
+symbol = "BTCUSDT"
+interval = Client.KLINE_INTERVAL_1HOUR
+
+print(f"Загрузка данных {symbol} с {start_date} по {end_date}...")
+data = get_historical_klines(symbol, interval, start_date, end_date)
+print(f"Загружено {len(data)} часовых свечей")
+
+# Расчет показателей волатильности
+# 1. Дневная волатильность (по стандартному отклонению цены закрытия)
+data['returns'] = data['close'].pct_change()
+data['log_returns'] = np.log(data['close'] / data['close'].shift(1))
+
+# Создадим окна разной длины для измерения волатильности
+windows = [24, 72, 168]  # 1 день, 3 дня, 7 дней (в часах)
+for window in windows:
+    # Реализованная волатильность
+    data[f'volatility_{window}h'] = data['log_returns'].rolling(window=window).std() * np.sqrt(window)
+    # True Range и ATR
+    data['TR'] = np.maximum(
+        data['high'] - data['low'],
+        np.maximum(
+            abs(data['high'] - data['close'].shift(1)),
+            abs(data['low'] - data['close'].shift(1))
+        )
+    )
+    data[f'ATR_{window}h'] = data['TR'].rolling(window=window).mean()
+    # Индекс волатильности VIX-подобный (основан на ATR)
+    data[f'vol_index_{window}h'] = (data[f'ATR_{window}h'] / data['close']) * 100
+
+# Удаляем строки с NaN значениями
+data = data.dropna()
+
+# Создаем датафрейм только с метриками волатильности для кластеризации
+features = data[[col for col in data.columns if 'volatility' in col or 'vol_index' in col or 'ATR' in col]]
+
+# Стандартизация данных перед кластеризацией
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(features)
+
+# Определение оптимального количества кластеров с помощью метода локтя
+inertia = []
+k_range = range(2, 10)
+for k in k_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(scaled_features)
+    inertia.append(kmeans.inertia_)
+
+# Построение графика метода локтя
+plt.figure(figsize=(12, 6))
+plt.plot(k_range, inertia, 'o-')
+plt.xlabel('Количество кластеров (k)')
+plt.ylabel('Инерция')
+plt.title('Метод локтя для определения оптимального k')
+plt.grid(True)
+plt.savefig('elbow_method.png')
+plt.close()
+
+# Применяем K-means (допустим, оптимальное k = 4, это стандартное предположение для рыночных режимов)
+k = 4  # Можно изменить на основе анализа метода локтя
+kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+data['cluster'] = kmeans.fit_predict(scaled_features)
+
+# Анализ результатов кластеризации
+cluster_stats = data.groupby('cluster').agg({
+    'close': ['mean', 'min', 'max'],
+    'volatility_24h': ['mean', 'min', 'max'],
+    'vol_index_24h': ['mean', 'min', 'max'],
+    'ATR_24h': ['mean', 'min', 'max']
+}).sort_values(('volatility_24h', 'mean'))
+
+# Присваиваем метки кластерам на основе волатильности
+volatility_levels = ['Низкая', 'Умеренная', 'Высокая', 'Экстремальная']
+cluster_mapping = {i: level for i, level in enumerate(volatility_levels[:k])}
+data['volatility_level'] = data['cluster'].map(lambda x: cluster_mapping[x])
+
+# Визуализация результатов
+plt.figure(figsize=(15, 10))
+
+# График цены и кластеров
+plt.subplot(2, 1, 1)
+for cluster, level in cluster_mapping.items():
+    cluster_data = data[data['cluster'] == cluster]
+    plt.scatter(cluster_data.index, cluster_data['close'], 
+                label=f'Кластер {cluster} - {level}', alpha=0.7, s=10)
+plt.plot(data.index, data['close'], color='gray', alpha=0.3)
+plt.title(f'Цена BTC/USDT и кластеры волатильности ({start_date} - {end_date})')
+plt.ylabel('Цена (USDT)')
+plt.legend()
+plt.grid(True)
+
+# График распределения кластеров во времени
+plt.subplot(2, 1, 2)
+plt.plot(data.index, data['volatility_24h'], label='Волатильность (24ч)')
+for cluster, level in cluster_mapping.items():
+    plt.fill_between(
+        data.index, 
+        data['volatility_24h'], 
+        where=(data['cluster'] == cluster),
+        alpha=0.3,
+        label=f'Кластер {cluster} - {level}'
+    )
+plt.title('Волатильность BTC/USDT и кластеры')
+plt.ylabel('Реализованная волатильность (24ч)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('btc_volatility_clusters.png')
+plt.close()
+
+# Анализ текущего состояния (последняя неделя)
+last_week = data.iloc[-168:]  # Последние 7 дней (168 часов)
+current_cluster = data.iloc[-1]['cluster']
+current_level = cluster_mapping[current_cluster]
+
+print("\n=== Анализ кластеров волатильности ===")
+print(f"Выделено {k} кластеров волатильности:")
+for cluster, stats in cluster_stats.iterrows():
+    level = cluster_mapping[cluster]
+    print(f"\nКластер {cluster} - {level} волатильность:")
+    print(f"  Средняя волатильность (24ч): {stats[('volatility_24h', 'mean')]:.4f}")
+    print(f"  Средний VIX-индекс (24ч): {stats[('vol_index_24h', 'mean')]:.2f}")
+    print(f"  Средний ATR (24ч): {stats[('ATR_24h', 'mean')]:.2f}")
+    
+print("\n=== Текущее состояние рынка ===")
+print(f"Текущая стадия волатильности: {current_level}")
+print(f"Значения показателей на последнюю дату ({data.index[-1].strftime('%Y-%m-%d %H:%M')}):")
+print(f"  Цена закрытия: {data.iloc[-1]['close']:.2f} USDT")
+print(f"  Волатильность (24ч): {data.iloc[-1]['volatility_24h']:.4f}")
+print(f"  Волатильность (72ч): {data.iloc[-1]['volatility_72h']:.4f}")
+print(f"  Волатильность (7д): {data.iloc[-1]['volatility_168h']:.4f}")
+
+# Дополнительный анализ периодов смены режимов
+transitions = data['cluster'].diff().fillna(0).abs()
+transition_dates = data[transitions > 0].index
+
+print("\n=== Анализ переходов между режимами волатильности ===")
+print(f"Всего переходов между режимами: {len(transition_dates)}")
+
+# Анализ продолжительности режимов
+regime_duration = []
+current_regime = data.iloc[0]['cluster']
+current_start = data.index[0]
+
+for idx, row in data.iterrows():
+    if row['cluster'] != current_regime:
+        duration = (idx - current_start).total_seconds() / 3600  # в часах
+        regime_duration.append({
+            'regime': cluster_mapping[current_regime],
+            'start': current_start,
+            'end': idx,
+            'duration_hours': duration,
+            'duration_days': duration / 24
+        })
+        current_regime = row['cluster']
+        current_start = idx
+
+# Добавляем последний режим
+duration = (data.index[-1] - current_start).total_seconds() / 3600
+regime_duration.append({
+    'regime': cluster_mapping[current_regime],
+    'start': current_start,
+    'end': data.index[-1],
+    'duration_hours': duration,
+    'duration_days': duration / 24
+})
+
+regime_df = pd.DataFrame(regime_duration)
+print("\n=== Продолжительность режимов волатильности ===")
+for level in volatility_levels[:k]:
+    level_stats = regime_df[regime_df['regime'] == level]
+    if not level_stats.empty:
+        print(f"\nРежим '{level}' волатильности:")
+        print(f"  Средняя продолжительность: {level_stats['duration_days'].mean():.2f} дней")
+        print(f"  Максимальная продолжительность: {level_stats['duration_days'].max():.2f} дней")
+        print(f"  Минимальная продолжительность: {level_stats['duration_days'].min():.2f} дней")
+        print(f"  Количество периодов: {len(level_stats)}")
+
+# Сохранение результатов
+data.to_csv('btc_volatility_analysis.csv')
+print("\nРезультаты сохранены в файлах 'btc_volatility_analysis.csv', 'elbow_method.png' и 'btc_volatility_clusters.png'")
