@@ -1,0 +1,389 @@
+import time
+import hmac
+import hashlib
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+class BinanceLiquidationPredictor:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = 'https://fapi.binance.com'
+        
+    def _generate_signature(self, query_string):
+        """Создаёт подпись HMAC SHA256 для аутентификации."""
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+    
+    def _get_headers(self):
+        """Возвращает заголовки для API запросов."""
+        return {
+            'X-MBX-APIKEY': self.api_key
+        }
+    
+    def _make_request(self, endpoint, method='GET', params=None, signed=False):
+        """Выполняет запрос к API Binance."""
+        url = f"{self.base_url}{endpoint}"
+        
+        if params is None:
+            params = {}
+            
+        if signed:
+            params['timestamp'] = int(time.time() * 1000)
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            signature = self._generate_signature(query_string)
+            params['signature'] = signature
+        
+        if method == 'GET':
+            response = requests.get(url, params=params, headers=self._get_headers())
+        else:
+            response = requests.post(url, params=params, headers=self._get_headers())
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"Ошибка: {response.status_code}, {response.text}")
+            return None
+    
+    def get_open_interest(self, symbol='BTCUSDT'):
+        """Получает данные об открытом интересе."""
+        endpoint = '/fapi/v1/openInterest'
+        params = {'symbol': symbol}
+        return self._make_request(endpoint, params=params)
+    
+    def get_funding_rate(self, symbol='BTCUSDT'):
+        """Получает текущую ставку финансирования."""
+        endpoint = '/fapi/v1/premiumIndex'
+        params = {'symbol': symbol}
+        return self._make_request(endpoint, params=params)
+    
+    def get_long_short_ratio(self, symbol='BTCUSDT', period='5m'):
+        """Получает соотношение длинных и коротких позиций."""
+        endpoint = '/futures/data/globalLongShortAccountRatio'
+        params = {'symbol': symbol, 'period': period}
+        return self._make_request(endpoint, params=params)
+    
+    def get_mark_price(self, symbol='BTCUSDT'):
+        """Получает текущую цену маркировки."""
+        endpoint = '/fapi/v1/premiumIndex'
+        params = {'symbol': symbol}
+        return self._make_request(endpoint, params=params)
+    
+    def get_ticker(self, symbol='BTCUSDT'):
+        """Получает данные тикера."""
+        endpoint = '/fapi/v1/ticker/24hr'
+        params = {'symbol': symbol}
+        return self._make_request(endpoint, params=params)
+    
+    def get_account_info(self):
+        """Получает информацию об аккаунте и позициях."""
+        endpoint = '/fapi/v2/account'
+        return self._make_request(endpoint, signed=True)
+    
+    def get_leverage_brackets(self, symbol='BTCUSDT'):
+        """Получает информацию о диапазонах кредитного плеча."""
+        endpoint = '/fapi/v1/leverageBracket'
+        params = {'symbol': symbol}
+        return self._make_request(endpoint, params=params, signed=True)
+    
+    def estimate_liquidation_levels(self, symbol='BTCUSDT', num_levels=20, price_range_percent=10):
+        """
+        Оценивает уровни ликвидации на основе открытого интереса и других рыночных данных.
+        
+        Args:
+            symbol: Символ торговой пары
+            num_levels: Количество ценовых уровней для оценки
+            price_range_percent: Процент от текущей цены для диапазона анализа (+/-)
+            
+        Returns:
+            DataFrame с оценками ликвидационных уровней
+        """
+        # Получаем текущую цену
+        mark_price_data = self.get_mark_price(symbol)
+        if not mark_price_data:
+            return None
+        
+        mark_price = float(mark_price_data.get('markPrice', 0))
+        
+        # Получаем данные об открытом интересе
+        open_interest_data = self.get_open_interest(symbol)
+        if not open_interest_data:
+            return None
+        
+        open_interest = float(open_interest_data.get('openInterest', 0))
+        
+        # Получаем данные о волатильности
+        ticker_data = self.get_ticker(symbol)
+        if not ticker_data:
+            return None
+        
+        # Суточная волатильность как % изменения от High к Low
+        high_price = float(ticker_data.get('highPrice', 0))
+        low_price = float(ticker_data.get('lowPrice', 0))
+        daily_volatility = (high_price - low_price) / mark_price
+        
+        # Получаем информацию о соотношении длинных и коротких позиций
+        # Для более реалистичных данных можно использовать API Binance
+        long_ratio = 0.55
+        short_ratio = 0.45
+        
+        # Определяем распределение кредитного плеча с более реалистичным распределением
+        leverage_distribution = {
+            'long': {
+                2: 0.15,   # 15% позиций с плечом 2x
+                3: 0.15,   # 15% позиций с плечом 3x
+                5: 0.25,   # 25% позиций с плечом 5x
+                10: 0.20,  # 20% позиций с плечом 10x
+                20: 0.15,  # 15% позиций с плечом 20x
+                50: 0.07,  # 7% позиций с плечом 50x
+                100: 0.03  # 3% позиций с плечом 100x
+            },
+            'short': {
+                2: 0.12,   # 12% позиций с плечом 2x
+                3: 0.13,   # 13% позиций с плечом 3x
+                5: 0.25,   # 25% позиций с плечом 5x
+                10: 0.25,  # 25% позиций с плечом 10x
+                20: 0.15,  # 15% позиций с плечом 20x
+                50: 0.07,  # 7% позиций с плечом 50x
+                100: 0.03  # 3% позиций с плечом 100x
+            }
+        }
+        
+        # Коэффициент масштабирования для более реалистичных объемов ликвидаций
+        # В реальности только часть открытого интереса будет ликвидирована
+        volume_scaling_factor = 0.02  # Только 2% от всего открытого интереса
+        
+        # Генерируем распределение цен входа вокруг текущей цены
+        # Это даст более реалистичное распределение ликвидационных уровней
+        entry_price_distribution = np.linspace(
+            mark_price * 0.98,  # Немного ниже текущей цены
+            mark_price * 1.02,  # Немного выше текущей цены
+            5                    # 5 разных уровней цен входа
+        )
+        
+        # Рассчитываем ликвидационные уровни для длинных позиций
+        long_liquidation_levels = []
+        for entry_price in entry_price_distribution:
+            for leverage, ratio in leverage_distribution['long'].items():
+                # Формула: Цена ликвидации = Цена входа × (1 - 1/Кредитное плечо)
+                liquidation_price = entry_price * (1 - 1/leverage)
+                
+                # Уменьшаем объем ликвидаций с помощью scaling_factor
+                # и добавляем случайную вариацию для более реалистичного распределения
+                random_factor = 0.8 + np.random.random() * 0.4  # от 0.8 до 1.2
+                volume = open_interest * long_ratio * ratio * entry_price * volume_scaling_factor * random_factor / len(entry_price_distribution)
+                
+                long_liquidation_levels.append({
+                    'price': liquidation_price,
+                    'volume': volume,
+                    'type': 'long',
+                    'leverage': leverage,
+                    'entry_price': entry_price
+                })
+        
+        # Рассчитываем ликвидационные уровни для коротких позиций
+        short_liquidation_levels = []
+        for entry_price in entry_price_distribution:
+            for leverage, ratio in leverage_distribution['short'].items():
+                # Формула: Цена ликвидации = Цена входа × (1 + 1/Кредитное плечо)
+                liquidation_price = entry_price * (1 + 1/leverage)
+                
+                random_factor = 0.8 + np.random.random() * 0.4
+                volume = open_interest * short_ratio * ratio * entry_price * volume_scaling_factor * random_factor / len(entry_price_distribution)
+                
+                short_liquidation_levels.append({
+                    'price': liquidation_price,
+                    'volume': volume,
+                    'type': 'short',
+                    'leverage': leverage,
+                    'entry_price': entry_price
+                })
+        
+        # Объединяем все уровни ликвидации
+        all_liquidation_levels = long_liquidation_levels + short_liquidation_levels
+        
+        # Создаем DataFrame
+        df_liquidations = pd.DataFrame(all_liquidation_levels)
+        
+        # Сортируем по цене
+        df_liquidations = df_liquidations.sort_values(by='price')
+        
+        # Фильтруем только ликвидации в заданном диапазоне цен (±price_range_percent%)
+        price_min = mark_price * (1 - price_range_percent/100)
+        price_max = mark_price * (1 + price_range_percent/100)
+        
+        df_liquidations = df_liquidations[
+            (df_liquidations['price'] >= price_min) & 
+            (df_liquidations['price'] <= price_max)
+        ]
+        
+        # Определяем размер бина для заданного количества уровней
+        price_range = price_max - price_min
+        bin_size = price_range / num_levels
+        
+        # Создаем ценовые диапазоны для группировки
+        df_liquidations['price_bin'] = np.floor((df_liquidations['price'] - price_min) / bin_size) * bin_size + price_min
+        
+        # Группировка объемов ликвидаций по ценовым диапазонам
+        grouped_liquidations = df_liquidations.groupby(['price_bin', 'type']).agg({
+            'volume': 'sum',
+            'leverage': 'mean'
+        }).reset_index()
+        
+        # Преобразуем объемы в миллионы долларов для удобства
+        grouped_liquidations['volume_millions'] = grouped_liquidations['volume'] / 1_000_000
+        
+        return grouped_liquidations
+    
+    def visualize_liquidation_heatmap(self, liquidation_data, symbol='BTCUSDT'):
+        """
+        Создает тепловую карту ликвидаций.
+        
+        Args:
+            liquidation_data: DataFrame с данными о ликвидациях
+            symbol: Символ торговой пары
+        """
+        if liquidation_data is None or liquidation_data.empty:
+            print("Нет данных для визуализации")
+            return
+        
+        # Получаем текущую цену
+        mark_price_data = self.get_mark_price(symbol)
+        if not mark_price_data:
+            return
+        
+        mark_price = float(mark_price_data.get('markPrice', 0))
+        
+        # Создаем отдельные DataFrame для длинных и коротких позиций
+        long_liquidations = liquidation_data[liquidation_data['type'] == 'long']
+        short_liquidations = liquidation_data[liquidation_data['type'] == 'short']
+        
+        # Создаем график
+        plt.figure(figsize=(14, 8))
+        
+        # Настраиваем ширину баров для более привлекательной визуализации
+        if not long_liquidations.empty:
+            width = (liquidation_data['price_bin'].max() - liquidation_data['price_bin'].min()) / (len(liquidation_data['price_bin'].unique()) * 2.5)
+        else:
+            width = 0.5  # Значение по умолчанию, если данных нет
+        
+        # Строим гистограмму для длинных ликвидаций (красный цвет)
+        if not long_liquidations.empty:
+            plt.bar(long_liquidations['price_bin'], 
+                   long_liquidations['volume_millions'], 
+                   color='crimson', 
+                   alpha=0.7,
+                   width=width,
+                   label='Long Liquidations (Sell Pressure)')
+        
+        # Строим гистограмму для коротких ликвидаций (зеленый цвет)
+        if not short_liquidations.empty:
+            plt.bar(short_liquidations['price_bin'], 
+                   short_liquidations['volume_millions'], 
+                   color='forestgreen', 
+                   alpha=0.7,
+                   width=width,
+                   label='Short Liquidations (Buy Pressure)')
+        
+        # Добавляем вертикальную линию для текущей цены
+        plt.axvline(x=mark_price, color='blue', linestyle='--', linewidth=2, 
+                   label=f'Current Price: ${mark_price:,.2f}')
+        
+        # Добавляем аннотации для самых крупных ликвидационных уровней
+        # Длинные позиции
+        if not long_liquidations.empty:
+            max_long_liq = long_liquidations.loc[long_liquidations['volume_millions'].idxmax()]
+            plt.annotate(f"${max_long_liq['volume_millions']:.2f}M",
+                        (max_long_liq['price_bin'], max_long_liq['volume_millions']),
+                        xytext=(0, 10), textcoords='offset points',
+                        ha='center', fontweight='bold', color='darkred')
+        
+        # Короткие позиции
+        if not short_liquidations.empty:
+            max_short_liq = short_liquidations.loc[short_liquidations['volume_millions'].idxmax()]
+            plt.annotate(f"${max_short_liq['volume_millions']:.2f}M",
+                        (max_short_liq['price_bin'], max_short_liq['volume_millions']),
+                        xytext=(0, 10), textcoords='offset points',
+                        ha='center', fontweight='bold', color='darkgreen')
+        
+        # Настраиваем график
+        plt.title(f'Estimated Liquidation Levels for {symbol} (±10% price range)', fontsize=14, fontweight='bold')
+        plt.xlabel('Price Levels ($)', fontsize=12)
+        plt.ylabel('Liquidation Volume (Millions USD)', fontsize=12)
+        plt.legend(loc='upper left')
+        plt.grid(True, alpha=0.3, linestyle='--')
+        
+        # Добавляем текст с пояснением
+        plt.figtext(0.5, 0.01, 
+                   "Red bars (below current price): Long liquidations that create sell pressure\n"
+                   "Green bars (above current price): Short liquidations that create buy pressure",
+                   ha='center', fontsize=10, bbox=dict(facecolor='white', alpha=0.7))
+        
+        # Форматируем метки по оси X в виде цен
+        formatter = plt.FuncFormatter(lambda x, pos: f'${x:,.0f}')
+        plt.gca().xaxis.set_major_formatter(formatter)
+        
+        # Автоматически устанавливаем предельные значения для лучшего отображения
+        x_min = mark_price * 0.9  # -10% от текущей цены
+        x_max = mark_price * 1.1  # +10% от текущей цены
+        plt.xlim(x_min, x_max)
+        
+        # Отображаем график
+        plt.tight_layout(rect=[0, 0.05, 1, 0.95])  # Делаем отступ снизу для текста пояснения
+        plt.show()
+        
+        return plt
+
+# Пример использования
+def main():
+    # ВНИМАНИЕ: API ключи должны храниться безопасно (в переменных окружения или в защищенном хранилище)
+    # Ключи предоставлены пользователем
+    api_key = 'ВАШ_API_КЛЮЧ'
+    api_secret = 'ВАШ_API_КЛЮЧ'
+    
+    predictor = BinanceLiquidationPredictor(api_key, api_secret)
+    
+    # Символ для анализа
+    symbol = 'BTCUSDT'
+    
+    # Получение текущей цены
+    mark_price_data = predictor.get_mark_price(symbol)
+    if mark_price_data:
+        mark_price = float(mark_price_data.get('markPrice', 0))
+        print(f"Текущая цена {symbol}: ${mark_price:,.2f}")
+    
+    # Получение открытого интереса
+    open_interest_data = predictor.get_open_interest(symbol)
+    if open_interest_data:
+        open_interest = float(open_interest_data.get('openInterest', 0))
+        print(f"Открытый интерес {symbol}: {open_interest:,.0f} контрактов")
+    
+    # Расчет уровней ликвидации с указанием ±10% ценового диапазона
+    liquidation_levels = predictor.estimate_liquidation_levels(symbol, num_levels=20, price_range_percent=10)
+    
+    if liquidation_levels is not None:
+        # Вывод результатов
+        print("\nРасчетные уровни ликвидации (±10% от текущей цены):")
+        print(liquidation_levels[['price_bin', 'type', 'volume_millions', 'leverage']])
+        
+        # Вывод суммарных объемов ликвидаций
+        long_volume = liquidation_levels[liquidation_levels['type'] == 'long']['volume_millions'].sum()
+        short_volume = liquidation_levels[liquidation_levels['type'] == 'short']['volume_millions'].sum()
+        print(f"\nСуммарный объем ликвидаций длинных позиций: ${long_volume:.2f}M")
+        print(f"Суммарный объем ликвидаций коротких позиций: ${short_volume:.2f}M")
+        print(f"Общий объем потенциальных ликвидаций: ${(long_volume + short_volume):.2f}M")
+        
+        # Визуализация ликвидационных уровней
+        predictor.visualize_liquidation_heatmap(liquidation_levels, symbol)
+    else:
+        print("Не удалось получить данные о ликвидациях")
+
+if __name__ == "__main__":
+    main()
