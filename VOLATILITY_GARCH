@@ -1,0 +1,248 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import pytz
+import requests
+from arch import arch_model
+import warnings
+warnings.filterwarnings('ignore')
+
+# Настройка отображения графиков
+plt.style.use('ggplot')
+sns.set(style="darkgrid")
+plt.rcParams['figure.figsize'] = (14, 8)
+plt.rcParams['font.size'] = 12
+
+# Получение данных из Binance API
+def get_binance_data(symbol, interval, start_time, end_time):
+    base_url = "https://api.binance.com/api/v3/klines"
+    
+    # Преобразование дат в timestamp (миллисекунды)
+    start_ts = int(datetime.strptime(start_time, "%d.%m.%Y").replace(tzinfo=pytz.UTC).timestamp() * 1000)
+    end_ts = int(datetime.strptime(end_time, "%d.%m.%Y").replace(tzinfo=pytz.UTC).timestamp() * 1000)
+    
+    # Параметры запроса
+    params = {
+        'symbol': symbol,
+        'interval': interval,
+        'startTime': start_ts,
+        'endTime': end_ts,
+        'limit': 1000
+    }
+    
+    all_klines = []
+    current_start = start_ts
+    
+    # Цикл для получения всех данных с пагинацией
+    while current_start < end_ts:
+        params['startTime'] = current_start
+        response = requests.get(base_url, params=params)
+        klines = response.json()
+        
+        if not klines:
+            break
+            
+        all_klines.extend(klines)
+        
+        # Обновляем время начала для следующего запроса
+        current_start = klines[-1][0] + 1
+        
+        # Небольшая задержка, чтобы избежать превышения лимитов API
+        import time
+        time.sleep(0.5)
+    
+    # Преобразование данных в DataFrame
+    df = pd.DataFrame(all_klines, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'number_of_trades',
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+    ])
+    
+    # Преобразование типов данных
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df['close_time'] = pd.to_datetime(df['close_time'], unit='ms')
+    
+    numeric_columns = ['open', 'high', 'low', 'close', 'volume', 
+                      'quote_asset_volume', 'taker_buy_base_asset_volume', 
+                      'taker_buy_quote_asset_volume']
+    
+    for col in numeric_columns:
+        df[col] = pd.to_numeric(df[col])
+    
+    # Установим время в качестве индекса
+    df.set_index('open_time', inplace=True)
+    
+    return df
+
+# Основная функция для анализа волатильности с использованием GARCH
+def analyze_volatility(data):
+    # Расчет логарифмических доходностей
+    data['returns'] = np.log(data['close'] / data['close'].shift(1)) * 100
+    data = data.dropna()
+    
+    # Визуализация цены и доходности
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12))
+    
+    ax1.plot(data.index, data['close'], label='BTCUSDT Close Price')
+    ax1.set_title('BTCUSDT Price')
+    ax1.set_ylabel('Price (USDT)')
+    ax1.legend()
+    
+    ax2.plot(data.index, data['returns'], label='Log Returns (%)', color='green')
+    ax2.set_title('BTCUSDT Log Returns (%)')
+    ax2.set_ylabel('Returns (%)')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig('btcusdt_price_returns.png')
+    plt.close()
+    
+    # Построение GARCH(1,1) модели
+    # GARCH(1,1) - наиболее распространенная спецификация для финансовых рядов
+    garch_model = arch_model(data['returns'], vol='Garch', p=1, q=1, mean='Zero')
+    garch_result = garch_model.fit(disp='off')
+    
+    print(garch_result.summary())
+    
+    # Получение условной волатильности
+    data['conditional_volatility'] = garch_result.conditional_volatility
+    
+    # Рассчитаем средние значения волатильности для определения стадий
+    mean_volatility = data['conditional_volatility'].mean()
+    std_volatility = data['conditional_volatility'].std()
+    
+    # Определение стадий волатильности
+    # Низкая: < среднее - 0.5*std
+    # Средняя: между низкой и высокой
+    # Высокая: > среднее + 0.5*std
+    # Экстремальная: > среднее + 1.5*std
+    
+    low_threshold = mean_volatility - 0.5 * std_volatility
+    high_threshold = mean_volatility + 0.5 * std_volatility
+    extreme_threshold = mean_volatility + 1.5 * std_volatility
+    
+    data['volatility_regime'] = 'Средняя'
+    data.loc[data['conditional_volatility'] < low_threshold, 'volatility_regime'] = 'Низкая'
+    data.loc[data['conditional_volatility'] > high_threshold, 'volatility_regime'] = 'Высокая'
+    data.loc[data['conditional_volatility'] > extreme_threshold, 'volatility_regime'] = 'Экстремальная'
+    
+    # Визуализация условной волатильности с обозначением стадий
+    plt.figure(figsize=(16, 8))
+    plt.plot(data.index, data['conditional_volatility'], label='Условная волатильность')
+    
+    # Добавим горизонтальные линии для порогов
+    plt.axhline(y=low_threshold, color='green', linestyle='--', label='Порог низкой волатильности')
+    plt.axhline(y=high_threshold, color='orange', linestyle='--', label='Порог высокой волатильности')
+    plt.axhline(y=extreme_threshold, color='red', linestyle='--', label='Порог экстремальной волатильности')
+    
+    plt.title('Условная волатильность BTCUSDT (GARCH(1,1))')
+    plt.ylabel('Волатильность (%)')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('btcusdt_volatility.png')
+    plt.close()
+    
+    # Подсчет количества дней в каждой стадии
+    regime_counts = data['volatility_regime'].value_counts()
+    print("Количество периодов в каждой стадии волатильности:")
+    print(regime_counts)
+    
+    # Создание диаграммы распределения стадий волатильности
+    plt.figure(figsize=(12, 6))
+    sns.countplot(x='volatility_regime', data=data, 
+                  order=['Низкая', 'Средняя', 'Высокая', 'Экстремальная'])
+    plt.title('Распределение стадий волатильности')
+    plt.xlabel('Стадия волатильности')
+    plt.ylabel('Количество периодов')
+    plt.tight_layout()
+    plt.savefig('volatility_regimes_distribution.png')
+    plt.close()
+    
+    # Анализ текущей стадии (последний период данных)
+    current_regime = data['volatility_regime'].iloc[-1]
+    current_volatility = data['conditional_volatility'].iloc[-1]
+    
+    print(f"\nТекущая стадия волатильности (на {data.index[-1].strftime('%d.%m.%Y')}): {current_regime}")
+    print(f"Текущее значение условной волатильности: {current_volatility:.4f}%")
+    
+    # Рассчитаем тренд волатильности за последние 30 дней
+    recent_volatility = data['conditional_volatility'].iloc[-30:]
+    volatility_trend = np.polyfit(range(len(recent_volatility)), recent_volatility, 1)[0]
+    
+    trend_description = "растущий" if volatility_trend > 0 else "снижающийся"
+    print(f"Тренд волатильности за последние 30 дней: {trend_description} ({volatility_trend:.6f})")
+    
+    # Анализируем, как долго мы находимся в текущей стадии
+    current_regime_start = None
+    for i in range(len(data)-1, 0, -1):
+        if data['volatility_regime'].iloc[i] != data['volatility_regime'].iloc[i-1]:
+            current_regime_start = data.index[i]
+            break
+    
+    if current_regime_start:
+        days_in_current_regime = (data.index[-1] - current_regime_start).days
+        print(f"Мы находимся в стадии '{current_regime}' уже {days_in_current_regime} дней (с {current_regime_start.strftime('%d.%m.%Y')})")
+    
+    # Создадим тепловую карту переходов между стадиями
+    data['prev_regime'] = data['volatility_regime'].shift(1)
+    transitions = data.dropna().groupby(['prev_regime', 'volatility_regime']).size().unstack(fill_value=0)
+    
+    # Нормализация для получения вероятностей перехода
+    transition_probabilities = transitions.div(transitions.sum(axis=1), axis=0)
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(transition_probabilities, annot=True, cmap='YlGnBu', fmt='.2f')
+    plt.title('Вероятности перехода между стадиями волатильности')
+    plt.tight_layout()
+    plt.savefig('volatility_transition_matrix.png')
+    plt.close()
+    
+    # Прогноз волатильности на следующие 7 дней
+    forecast = garch_result.forecast(horizon=7)
+    forecast_volatility = np.sqrt(forecast.variance.values[-1, :])
+    
+    # Определение прогнозируемых стадий
+    forecast_regimes = []
+    for vol in forecast_volatility:
+        if vol < low_threshold:
+            forecast_regimes.append('Низкая')
+        elif vol > extreme_threshold:
+            forecast_regimes.append('Экстремальная')
+        elif vol > high_threshold:
+            forecast_regimes.append('Высокая')
+        else:
+            forecast_regimes.append('Средняя')
+    
+    forecast_df = pd.DataFrame({
+        'date': [data.index[-1] + timedelta(days=i+1) for i in range(7)],
+        'forecast_volatility': forecast_volatility,
+        'forecast_regime': forecast_regimes
+    })
+    
+    print("\nПрогноз волатильности на следующие 7 дней:")
+    for i, row in forecast_df.iterrows():
+        print(f"{row['date'].strftime('%d.%m.%Y')}: {row['forecast_volatility']:.4f}% - {row['forecast_regime']}")
+    
+    # Сохраним данные в CSV для дальнейшего анализа
+    data.to_csv('btcusdt_volatility_analysis.csv')
+    
+    return data, garch_result
+
+# Основной код
+if __name__ == "__main__":
+    # Параметры анализа
+    symbol = "BTCUSDT"
+    interval = "1h"  # 1-часовой таймфрейм
+    start_date = "01.01.2022"
+    end_date = "01.05.2025"
+    
+    print(f"Получение данных {symbol} с {start_date} по {end_date}...")
+    data = get_binance_data(symbol, interval, start_date, end_date)
+    print(f"Получено {len(data)} записей.")
+    
+    print("\nАнализ волатильности с использованием GARCH(1,1)...")
+    volatility_data, garch_model = analyze_volatility(data)
+    
+    print("\nАнализ завершен. Результаты сохранены в CSV и графиках.")
