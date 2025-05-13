@@ -1,0 +1,261 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from binance.client import Client
+from arch import arch_model
+import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# Настройка визуализации
+plt.style.use('ggplot')
+sns.set_style('darkgrid')
+plt.rcParams['figure.figsize'] = (14, 7)
+plt.rcParams['font.size'] = 14
+
+# Функция для получения исторических данных с Binance
+def get_binance_data(symbol, interval, start_date, end_date):
+    # Создаем клиент Binance без ключей API (для публичных данных)
+    client = Client()
+    
+    # Преобразуем даты в формат timestamp для Binance API
+    start_timestamp = int(datetime.datetime.strptime(start_date, "%d.%m.%Y").timestamp() * 1000)
+    end_timestamp = int(datetime.datetime.strptime(end_date, "%d.%m.%Y").timestamp() * 1000)
+    
+    # Получаем исторические данные
+    print(f"Загрузка данных для {symbol} с {start_date} по {end_date}...")
+    klines = client.get_historical_klines(
+        symbol=symbol,
+        interval=interval,
+        start_str=start_timestamp,
+        end_str=end_timestamp
+    )
+    
+    # Преобразуем данные в DataFrame
+    df = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'quote_asset_volume', 'number_of_trades', 
+        'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+    ])
+    
+    # Конвертируем типы данных
+    numeric_columns = ['open', 'high', 'low', 'close', 'volume']
+    df[numeric_columns] = df[numeric_columns].astype(float)
+    
+    # Конвертируем timestamp в datetime
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    
+    return df
+
+# Функция для вычисления логарифмических доходностей
+def calculate_returns(df):
+    # Вычисляем логарифмические доходности
+    df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+    # Удаляем строки с NaN
+    df = df.dropna()
+    return df
+
+# Функция для анализа волатильности с помощью модели ARCH
+def analyze_volatility_arch(returns, p=1):
+    # Создаем и обучаем модель ARCH(p)
+    model = arch_model(returns, vol='ARCH', p=p, mean='Zero', rescale=False)
+    model_fit = model.fit(disp='off')
+    
+    # Получаем условную волатильность
+    conditional_volatility = model_fit.conditional_volatility
+    
+    # Создаем DataFrame с результатами
+    volatility_df = pd.DataFrame({
+        'return': returns,
+        'volatility': conditional_volatility
+    })
+    
+    return volatility_df, model_fit
+
+# Функция для определения стадии волатильности
+def determine_volatility_stage(volatility_df, window=30):
+    # Вычисляем скользящие средние волатильности
+    volatility_df['volatility_ma'] = volatility_df['volatility'].rolling(window=window).mean()
+    volatility_df['volatility_std'] = volatility_df['volatility'].rolling(window=window).std()
+    
+    # Определяем процентили волатильности
+    q_low = volatility_df['volatility'].quantile(0.25)
+    q_mid_low = volatility_df['volatility'].quantile(0.5)
+    q_mid_high = volatility_df['volatility'].quantile(0.75)
+    q_high = volatility_df['volatility'].quantile(0.9)
+    
+    # Определяем стадии волатильности
+    conditions = [
+        (volatility_df['volatility'] <= q_low),
+        (volatility_df['volatility'] > q_low) & (volatility_df['volatility'] <= q_mid_low),
+        (volatility_df['volatility'] > q_mid_low) & (volatility_df['volatility'] <= q_mid_high),
+        (volatility_df['volatility'] > q_mid_high) & (volatility_df['volatility'] <= q_high),
+        (volatility_df['volatility'] > q_high)
+    ]
+    
+    choices = ['Очень низкая', 'Низкая', 'Средняя', 'Высокая', 'Экстремальная']
+    volatility_df['volatility_stage'] = np.select(conditions, choices, default='Неопределенная')
+    
+    # Определяем направление волатильности (растет или падает)
+    volatility_df['volatility_direction'] = volatility_df['volatility'].diff().apply(
+        lambda x: 'Растет' if x > 0 else 'Падает' if x < 0 else 'Стабильна'
+    )
+    
+    # Определяем текущую стадию (на последнюю дату)
+    current_stage = volatility_df['volatility_stage'].iloc[-1]
+    current_direction = volatility_df['volatility_direction'].iloc[-1]
+    current_volatility = volatility_df['volatility'].iloc[-1]
+    
+    return volatility_df, current_stage, current_direction, current_volatility
+
+# Функция для визуализации результатов
+def visualize_results(df, volatility_df):
+    # Создаем фигуру с тремя подграфиками
+    fig, axs = plt.subplots(3, 1, figsize=(16, 14), gridspec_kw={'height_ratios': [2, 1, 1]})
+    
+    # График 1: цена закрытия
+    axs[0].plot(df.index, df['close'], label='Цена BTCUSDT', color='blue')
+    axs[0].set_ylabel('Цена (USDT)')
+    axs[0].set_title('Цена закрытия BTCUSDT')
+    axs[0].legend()
+    
+    # График 2: доходность
+    axs[1].plot(volatility_df.index, volatility_df['return'], label='Доходность', color='green')
+    axs[1].set_ylabel('Логарифмическая доходность')
+    axs[1].set_title('Логарифмическая доходность BTCUSDT')
+    axs[1].legend()
+    
+    # График 3: волатильность
+    axs[2].plot(volatility_df.index, volatility_df['volatility'], label='Волатильность (ARCH)', color='red')
+    axs[2].plot(volatility_df.index, volatility_df['volatility_ma'], label='Скользящее среднее волатильности', color='orange')
+    axs[2].set_ylabel('Волатильность')
+    axs[2].set_title('Условная волатильность BTCUSDT (модель ARCH)')
+    axs[2].legend()
+    
+    # Настройка общей фигуры
+    plt.tight_layout()
+    plt.show()
+    
+    # Создаем тепловую карту стадий волатильности
+    plt.figure(figsize=(16, 6))
+    
+    # Создаем цветовую схему для стадий волатильности
+    cmap = {
+        'Очень низкая': 'green',
+        'Низкая': 'lightgreen',
+        'Средняя': 'yellow',
+        'Высокая': 'orange',
+        'Экстремальная': 'red',
+        'Неопределенная': 'grey'
+    }
+    
+    # Преобразуем категории в числовые значения для удобства визуализации
+    stage_to_num = {
+        'Очень низкая': 1,
+        'Низкая': 2,
+        'Средняя': 3,
+        'Высокая': 4,
+        'Экстремальная': 5,
+        'Неопределенная': 0
+    }
+    
+    volatility_df['stage_num'] = volatility_df['volatility_stage'].map(stage_to_num)
+    
+    # Отрисовываем график волатильности с цветовой кодировкой стадий
+    plt.scatter(
+        volatility_df.index, 
+        volatility_df['volatility'],
+        c=volatility_df['stage_num'], 
+        cmap='RdYlGn_r',
+        s=30,
+        alpha=0.6
+    )
+    plt.colorbar(label='Стадия волатильности', ticks=[1, 2, 3, 4, 5])
+    plt.grid(True, alpha=0.3)
+    plt.ylabel('Волатильность')
+    plt.title('Стадии волатильности BTCUSDT')
+    plt.tight_layout()
+    plt.show()
+
+# Функция для вывода статистики по стадиям волатильности
+def print_volatility_statistics(volatility_df, model_fit):
+    # Общая статистика
+    print("\n===== Статистика волатильности =====")
+    print(f"Средняя волатильность: {volatility_df['volatility'].mean():.6f}")
+    print(f"Медианная волатильность: {volatility_df['volatility'].median():.6f}")
+    print(f"Минимальная волатильность: {volatility_df['volatility'].min():.6f}")
+    print(f"Максимальная волатильность: {volatility_df['volatility'].max():.6f}")
+    
+    # Статистика по стадиям
+    print("\n===== Распределение стадий волатильности =====")
+    stage_counts = volatility_df['volatility_stage'].value_counts()
+    stage_percentages = (stage_counts / len(volatility_df)) * 100
+    
+    # Объединяем их в один DataFrame для вывода
+    stage_stats = pd.DataFrame({
+        'Количество дней': stage_counts,
+        'Процент времени (%)': stage_percentages
+    })
+    
+    print(stage_stats)
+    
+    # Статистика по параметрам ARCH модели
+    print("\n===== Параметры модели ARCH =====")
+    print(model_fit.summary())
+
+# Функция для определения текущей стадии волатильности
+def analyze_current_volatility(volatility_df, current_stage, current_direction, current_volatility):
+    # Получаем данные за последний месяц
+    last_month = volatility_df.iloc[-30:]
+    
+    # Тренд волатильности за последний месяц
+    volatility_trend = 'восходящий' if last_month['volatility'].iloc[-1] > last_month['volatility'].iloc[0] else 'нисходящий'
+    
+    # Средняя волатильность за последний месяц
+    avg_volatility_month = last_month['volatility'].mean()
+    
+    # Сравнение текущей волатильности со средней за месяц
+    comparison = "выше" if current_volatility > avg_volatility_month else "ниже"
+    
+    print("\n===== Текущая стадия волатильности =====")
+    print(f"Текущая стадия волатильности: {current_stage}")
+    print(f"Направление волатильности: {current_direction}")
+    print(f"Текущее значение волатильности: {current_volatility:.6f}")
+    print(f"Средняя волатильность за последний месяц: {avg_volatility_month:.6f}")
+    print(f"Текущая волатильность {comparison} средней за последний месяц")
+    print(f"Тренд волатильности за последний месяц: {volatility_trend}")
+
+# Основная функция
+def main():
+    # Параметры
+    symbol = 'BTCUSDT'
+    interval = '1h'  # 1-часовой таймфрейм
+    start_date = '01.01.2022'
+    end_date = '01.05.2025'
+    arch_p = 5  # Порядок модели ARCH
+    
+    # Получаем данные
+    df = get_binance_data(symbol, interval, start_date, end_date)
+    
+    # Вычисляем доходности
+    df = calculate_returns(df)
+    
+    # Анализируем волатильность
+    volatility_df, model_fit = analyze_volatility_arch(df['log_return'], p=arch_p)
+    
+    # Определяем стадию волатильности
+    volatility_df, current_stage, current_direction, current_volatility = determine_volatility_stage(volatility_df)
+    
+    # Визуализируем результаты
+    visualize_results(df, volatility_df)
+    
+    # Выводим статистику
+    print_volatility_statistics(volatility_df, model_fit)
+    
+    # Анализируем текущую стадию волатильности
+    analyze_current_volatility(volatility_df, current_stage, current_direction, current_volatility)
+
+if __name__ == "__main__":
+    main()
